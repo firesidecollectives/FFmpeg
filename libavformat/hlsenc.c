@@ -72,6 +72,7 @@ typedef enum {
 #define HLS_MICROSECOND_UNIT   1000000
 #define BUFSIZE (16 * 1024)
 #define POSTFIX_PATTERN "_%d"
+#define MAX_NUM_VARIANT_BITRATES (30)
 
 typedef struct HLSSegment {
     char filename[MAX_URL_SIZE];
@@ -215,6 +216,10 @@ typedef struct HLSContext {
     int allowcache;
     int64_t recording_time;
     int64_t max_seg_size; // every segment file max size
+
+    char *variant_bitrates; // Comma separated list of integer bitrates for the variant TS multiplexes
+    int nmuxrates; // The number of mux rates specified in variant_bitrates (set when parsing the cmdline argument)
+    int muxrates[MAX_NUM_VARIANT_BITRATES]; // The mux rates specified on the command line
 
     char *baseurl;
     char *vtt_format_options_str;
@@ -844,7 +849,7 @@ static int hls_encryption_start(AVFormatContext *s,  VariantStream *vs)
     return 0;
 }
 
-static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
+static int hls_mux_init(AVFormatContext *s, VariantStream *vs, int muxrate)
 {
     AVDictionary *options = NULL;
     HLSContext *hls = s->priv_data;
@@ -944,6 +949,10 @@ static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
         snprintf(period, sizeof(period), "%d", (INT_MAX / 2) - 1);
         av_dict_set(&options, "sdt_period", period, AV_DICT_DONT_OVERWRITE);
         av_dict_set(&options, "pat_period", period, AV_DICT_DONT_OVERWRITE);
+        if(muxrate) {
+            av_log(s, AV_LOG_INFO, "Setting variant bitrate to %d", muxrate);
+            av_dict_set_int(&options, "muxrate", muxrate, AV_DICT_DONT_OVERWRITE);
+        }
     }
     ret = avformat_init_output(oc, &options);
     remaining_options = av_dict_count(options);
@@ -2858,6 +2867,26 @@ failed:
 }
 
 
+// Parses the comma delimited list of variant bitrates from the hls_variant_bitrates command line argument
+static void parse_variant_bitrates(AVFormatContext *s)
+{
+    HLSContext *hls = s->priv_data;
+    char *token;
+    char *saveptr=NULL;
+    hls->nmuxrates = 0;
+    token = av_strtok(hls->variant_bitrates, ",", &saveptr);
+
+    while(token != NULL) {
+        hls->muxrates[hls->nmuxrates++] = atoi(token);
+        if(hls->nmuxrates >= MAX_NUM_VARIANT_BITRATES) {
+            // Reached the maximum number of bitrates we can store in the context
+            av_log(hls, AV_LOG_WARNING, "Too many values for hls_variant_bitrates - ignoring some.\n");
+            return;
+        }
+        token = av_strtok(NULL, ",", &saveptr);
+    }
+}
+
 static int hls_init(AVFormatContext *s)
 {
     int ret = 0;
@@ -2871,6 +2900,7 @@ static int hls_init(AVFormatContext *s)
     int http_base_proto = ff_is_http_proto(s->url);
     int fmp4_init_filename_len = strlen(hls->fmp4_init_filename) + 1;
     double initial_program_date_time = av_gettime() / 1000000.0;
+    int muxrate=0;
 
     if (hls->use_localtime) {
         pattern = get_default_pattern_localtime_fmt(s);
@@ -2952,6 +2982,11 @@ static int hls_init(AVFormatContext *s)
         av_log(s, AV_LOG_WARNING,
                "'split_by_time' and 'independent_segments' cannot be "
                "enabled together. Disabling 'independent_segments' flag\n");
+    }
+
+    // We only support setting the muxrate of individual variant streams if our output is MPEG TS:
+    if(hls->variant_bitrates && hls->segment_type == SEGMENT_TYPE_MPEGTS) {
+        parse_variant_bitrates(s);
     }
 
     for (i = 0; i < hls->nb_varstreams; i++) {
@@ -3087,7 +3122,12 @@ static int hls_init(AVFormatContext *s)
                 *p = '.';
         }
 
-        if ((ret = hls_mux_init(s, vs)) < 0)
+        if(i < hls->nmuxrates) {
+            muxrate = hls->muxrates[i];
+        } else {
+            muxrate = 0;
+        }
+        if ((ret = hls_mux_init(s, vs, muxrate)) < 0)
             return ret;
 
         if (hls->flags & HLS_APPEND_LIST) {
@@ -3126,6 +3166,7 @@ static const AVOption options[] = {
     {"hls_base_url",  "url to prepend to each playlist entry",   OFFSET(baseurl), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       E},
     {"hls_segment_filename", "filename template for segment files", OFFSET(segment_filename),   AV_OPT_TYPE_STRING, {.str = NULL},            0,       0,         E},
     {"hls_segment_size", "maximum size per segment file, (in bytes)",  OFFSET(max_seg_size),    AV_OPT_TYPE_INT,    {.i64 = 0},               0,       INT_MAX,   E},
+    {"hls_variant_bitrates", "List of bitrates to use for the variant streams (TS only)", OFFSET(variant_bitrates), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, E},
     {"hls_key_info_file",    "file with key URI and key file path", OFFSET(key_info_file),      AV_OPT_TYPE_STRING, {.str = NULL},            0,       0,         E},
     {"hls_enc",    "enable AES128 encryption support", OFFSET(encrypt),      AV_OPT_TYPE_BOOL, {.i64 = 0},            0,       1,         E},
     {"hls_enc_key",    "hex-coded 16 byte key to encrypt the segments", OFFSET(key),      AV_OPT_TYPE_STRING, .flags = E},
